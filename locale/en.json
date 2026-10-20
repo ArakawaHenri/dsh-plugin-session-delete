@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-plugin-session-delete",
+    "description": "Permanently delete archived sessions."
+  }
+}

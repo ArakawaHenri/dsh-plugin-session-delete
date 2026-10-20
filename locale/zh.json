@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-plugin-session-delete",
+    "description": "永久删除已归档的会话。"
+  }
+}

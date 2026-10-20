@@ -1,0 +1,64 @@
+{
+  "name": "dsh-plugin-session-delete",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Safely delete archived DeepSeek Harness sessions",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArakawaHenri/dsh-plugin-session-delete.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ArakawaHenri/dsh-plugin-session-delete/issues"
+  },
+  "homepage": "https://github.com/ArakawaHenri/dsh-plugin-session-delete#readme",
+  "engines": {
+    "dsh": "0.2.1-rc.2"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "deletion.js",
+    "remote.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2"
+  },
+  "scripts": {
+    "build": "node scripts/build-client.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check index.js && node --check deletion.js && node --check client.js && node --check remote.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2"
+  }
+}
