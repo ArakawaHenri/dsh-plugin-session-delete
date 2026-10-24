@@ -188,6 +188,47 @@ window.__ModuleLoader__.load({
       .dsh-sd-danger {
         color: var(--dsw-alias-state-error-primary);
       }
+      .dsh-sd-recovery {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        max-width: min(380px, calc(100vw - 48px));
+        padding: 12px 16px;
+        box-sizing: border-box;
+        border-radius: var(--dsw-radius-md);
+        background: var(--dsw-alias-bg-layer-2);
+        box-shadow: var(--dsw-elevation-prominent);
+        color: var(--dsw-alias-label-primary);
+        font-size: 13px;
+        line-height: 20px;
+        pointer-events: auto;
+      }
+      .dsh-sd-recovery-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .dsh-sd-recovery button {
+        flex: none;
+      }
+      .dsh-sd-recovery select {
+        min-width: 0;
+        max-width: 180px;
+        text-overflow: ellipsis;
+      }
+      .dsh-sd-recovery span {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .dsh-sd-refresh-error {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+      }
       @keyframes dsh-sd-modal-enter {
         from { opacity: 0; }
         to { opacity: 1; }
@@ -244,13 +285,24 @@ window.__ModuleLoader__.load({
         confirm: 'Delete session',
         deleting: 'Deleting…',
         close: 'Close',
+        cleanupHeading: 'Finish removing session?',
+        cleanupDescription: 'The conversation logs have been deleted. Retry to remove the remaining workspace and archive records.',
+        cleanupFailed: 'Could not finish removing the session records.',
+        retryCleanup: 'Retry cleanup',
+        cleaning: 'Cleaning up…',
+        unlistedArchive: 'An archived session is missing from the session list.',
+        reviewCleanup: 'Review cleanup',
+        refreshFailed: 'Could not refresh the session list.',
+        refreshIncomplete: 'The refresh did not finish. Please retry.',
+        retryRefresh: 'Retry refresh',
         inUse:
-          'This session is still open or retained. Close it in other windows and wait for its work to stop. If needed, restart Harness and try again.',
+          'This session is still in use by another owner. Close it in other windows or processes and try again.',
         notArchived: 'This session is no longer archived. Archive it before deleting.',
         active: 'This session still has running work or active reminders. Stop them before deleting.',
         format:
           'This session uses an older or unsupported format. Open it to migrate, then archive and close it before retrying.',
-        unsupported: 'This storage backend is not supported by this plugin version.',
+        unsupported: 'This session storage does not expose the local JSONL interfaces needed for deletion.',
+        runtime: 'Harness did not expose a complete release action for this retained session. Restart Harness and try again.',
         unavailable: 'The session log cannot be verified. Its storage and metadata were left unchanged.',
       },
       zh: {
@@ -263,11 +315,22 @@ window.__ModuleLoader__.load({
         confirm: '删除会话',
         deleting: '正在删除…',
         close: '关闭',
-        inUse: '此会话仍被打开或占用。请在其他窗口关闭它，等待相关工作结束。若仍被占用，可重启 Harness 后重试。',
+        cleanupHeading: '完成会话清理？',
+        cleanupDescription: '对话日志已经删除。请重试清理剩余的工作区和归档记录。',
+        cleanupFailed: '会话记录尚未清理完成。',
+        retryCleanup: '重试清理',
+        cleaning: '正在清理…',
+        unlistedArchive: '有归档记录未出现在会话列表中。',
+        reviewCleanup: '查看并清理',
+        refreshFailed: '会话列表刷新失败。',
+        refreshIncomplete: '刷新尚未完成，请重试。',
+        retryRefresh: '重试刷新',
+        inUse: '此会话仍被其他实例占用。请在其他窗口或进程中关闭它后重试。',
         notArchived: '此会话已不在归档中，请先归档再删除。',
         active: '此会话仍有运行中的工作或启用的提醒，请先停止后再删除。',
         format: '此会话使用旧格式或暂不支持的格式。请打开它完成迁移，再归档并关闭后重试。',
-        unsupported: '当前插件版本暂不支持此存储后端。',
+        unsupported: '当前会话存储未提供删除所需的本地 JSONL 接口。',
+        runtime: 'Harness 未提供此常驻会话的完整释放操作，请重启 Harness 后重试。',
         unavailable: '无法核实此会话的日志状态，文件和会话记录均未改动。',
       },
     };
@@ -278,7 +341,9 @@ window.__ModuleLoader__.load({
       'session-active': 'active',
       'unsupported-format': 'format',
       'unsupported-backend': 'unsupported',
+      'unsupported-runtime': 'runtime',
       'session-unavailable': 'unavailable',
+      'cleanup-failed': 'cleanupFailed',
     };
 
     function TrashIcon() {
@@ -329,8 +394,17 @@ window.__ModuleLoader__.load({
     function mountUI(ctx) {
       ctx.effect(() => ctx.locale.register('dsh.sessionDelete', dictionaries));
       const t = ctx.locale.bind('dsh.sessionDelete');
+      // Workspace list sources expose instance methods, so retain their receiver.
+      const sessionSource = {
+        subscribe: listener => ctx.sessions.list.subscribe(listener),
+        getSnapshot: () => ctx.sessions.list.getSnapshot(),
+      };
+      const workspaceSource = {
+        subscribe: listener => ctx.workspaces.list.subscribe(listener),
+        getSnapshot: () => ctx.workspaces.list.getSnapshot(),
+      };
 
-      let state = null;
+      let state = { confirmation: null, refreshError: null };
       let disposed = false;
       const listeners = new Set();
       const store = {
@@ -343,15 +417,45 @@ window.__ModuleLoader__.load({
 
       function setState(next) {
         if (disposed) return;
-        state = next;
+        state = { ...state, ...next };
         for (const fn of listeners) fn();
       }
 
       ctx.effect(() => () => {
         disposed = true;
         listeners.clear();
-        state = null;
+        state = { confirmation: null, refreshError: null };
       });
+
+      async function refreshList() {
+        await ctx.sessions.refresh();
+        // The public list omits errors and refresh() resolves on RPC failures.
+        // Read the native manager's result after the request has settled.
+        const result = ctx.sessions.manager.getListSnapshot();
+        // Reconnection can replace the awaited request with a still-loading one.
+        if (result.state !== 'idle') throw result.error || new Error(t('refreshIncomplete'));
+      }
+
+      async function refreshSessions(sessionId) {
+        try {
+          await refreshList();
+          // refresh() joins an existing request. If it returned an older list,
+          // make one fresh read after that request has finished.
+          if (ctx.sessions.list.getSnapshot().ids.includes(sessionId)) await refreshList();
+          setState({ refreshError: null });
+        } catch (error) {
+          setState({ refreshError: String(error?.message || error) });
+          console.warn('[dsh-plugin-session-delete] List refresh failed:', error);
+        }
+      }
+
+      ctx.effect(() => ctx.remote.$on('api-session/removed', (sessionId, source) => {
+        if (source === 'dsh-plugin-session-delete') return refreshSessions(sessionId);
+      }));
+
+      function showConfirmation(sessionId, title) {
+        setState({ confirmation: { sessionId, title: title || t('untitled'), busy: false, error: null, cleanupPending: false } });
+      }
 
       function useTranslation() {
         React.useSyncExternalStore(
@@ -377,12 +481,7 @@ window.__ModuleLoader__.load({
             onClick: event => {
               event.stopPropagation();
               setMenuOpen(false);
-              setState({
-                sessionId: props.sessionId,
-                title: props.displayTitle || translate('untitled'),
-                busy: false,
-                error: null,
-              });
+              showConfirmation(props.sessionId, props.displayTitle);
             },
           },
           h('span', { className: 'dsh-sd-menu-icon' }, TrashIcon()),
@@ -392,7 +491,9 @@ window.__ModuleLoader__.load({
 
       function Overlay() {
         const translate = useTranslation();
-        const current = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        const { confirmation: current, refreshError } = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        const sessions = React.useSyncExternalStore(sessionSource.subscribe, sessionSource.getSnapshot);
+        const workspaces = React.useSyncExternalStore(workspaceSource.subscribe, workspaceSource.getSnapshot);
         const dialog = React.useRef(null);
 
         React.useEffect(() => {
@@ -402,36 +503,78 @@ window.__ModuleLoader__.load({
           }
         }, [current]);
 
+        const refreshNotice = refreshError && h(React.Fragment, null,
+          h('span', null, `${translate('refreshFailed')} ${refreshError}`),
+          h('button', {
+            type: 'button', className: 'dsh-sd-button',
+            onClick: () => refreshSessions(),
+          }, translate('retryRefresh')),
+        );
+
         if (!current) {
-          return h('style', null, styles);
+          // The archive set is durable, so failed cleanup remains reachable
+          // after a reload without keeping a separate deletion receipt.
+          const listed = new Set(sessions.ids);
+          const unlisted = sessions.phase === 'ready' && workspaces.phase === 'ready'
+            ? workspaces.archivedSessionIds.filter(id => !listed.has(id))
+            : [];
+          const review = id => showConfirmation(id, sessions.byId[id]?.displayTitle);
+          return h(React.Fragment, null,
+            h('style', null, styles),
+            (refreshNotice || unlisted.length > 0) && h('aside', { className: 'dsh-sd-recovery', role: 'status' },
+              refreshNotice && h('div', { className: 'dsh-sd-recovery-row', role: 'alert' }, refreshNotice),
+              unlisted.length > 0 && h('div', { className: 'dsh-sd-recovery-row' },
+                h('span', null, translate('unlistedArchive')),
+                unlisted.length === 1 ? h('button', {
+                  type: 'button', className: 'dsh-sd-button',
+                  onClick: () => review(unlisted[0]),
+                }, translate('reviewCleanup')) : h('select', {
+                  className: 'dsh-sd-button',
+                  'aria-label': translate('reviewCleanup'),
+                  value: '',
+                  onChange: event => review(event.target.value),
+                },
+                  h('option', { value: '', disabled: true }, translate('reviewCleanup')),
+                  ...unlisted.map(id => h('option', { key: id, value: id }, sessions.byId[id]?.displayTitle || id)),
+                ),
+              ),
+            ),
+          );
         }
 
         const dismiss = () => {
           if (!current.busy) {
             dialog.current?.close();
-            setState(null);
+            setState({ confirmation: null });
           }
         };
 
         const perform = async () => {
-          if (state !== current || current.busy) return;
-          setState({ ...current, busy: true, error: null });
+          if (state.confirmation !== current || current.busy) return;
+          setState({ confirmation: { ...current, busy: true, error: null } });
           try {
             const response = await ctx.remote.sessionDelete.deleteArchived(current.sessionId);
             if (!response.ok) throw response.error;
             dialog.current?.close();
-            setState(null);
+            setState({ confirmation: null });
             for (const warning of response.value.warnings) {
               console.warn('[dsh-plugin-session-delete]', warning);
             }
           } catch (error) {
             const code = String(error?.code || '').split('/').at(-1);
             const key = ERROR_KEYS[code];
-            setState({
+            const cleanupFailed = code === 'cleanup-failed';
+            setState({ confirmation: {
               ...current,
               busy: false,
-              error: key ? translate(key) : String(error?.message || error),
-            });
+              cleanupPending: current.cleanupPending || cleanupFailed,
+              error: cleanupFailed
+                ? `${translate('cleanupFailed')} ${error.details.reason}`
+                : key ? translate(key) : String(error?.message || error),
+            } });
+          } finally {
+            // A list request must not keep a completed deletion's dialog busy.
+            void refreshSessions(current.sessionId);
           }
         };
 
@@ -473,7 +616,7 @@ window.__ModuleLoader__.load({
                 h(
                   'h2',
                   { id: 'dsh-sd-title', className: 'dsh-sd-title' },
-                  translate('heading'),
+                  translate(current.cleanupPending ? 'cleanupHeading' : 'heading'),
                 ),
                 h(
                   'button',
@@ -490,7 +633,7 @@ window.__ModuleLoader__.load({
               h(
                 'p',
                 { id: 'dsh-sd-description', className: 'dsh-sd-description' },
-                translate('description'),
+                translate(current.cleanupPending ? 'cleanupDescription' : 'description'),
               ),
               h(
                 'div',
@@ -498,6 +641,7 @@ window.__ModuleLoader__.load({
                 h('p', { className: 'dsh-sd-session' }, current.title),
                 h('code', { className: 'dsh-sd-id' }, current.sessionId),
                 current.error && h('p', { role: 'alert', className: 'dsh-sd-error' }, current.error),
+                refreshNotice && h('div', { className: 'dsh-sd-refresh-error', role: 'alert' }, refreshNotice),
               ),
             ),
             h(
@@ -512,7 +656,7 @@ window.__ModuleLoader__.load({
                   autoFocus: true,
                   onClick: dismiss,
                 },
-                translate('cancel'),
+                translate(current.cleanupPending ? 'close' : 'cancel'),
               ),
               h(
                 'button',
@@ -522,7 +666,9 @@ window.__ModuleLoader__.load({
                   disabled: current.busy,
                   onClick: perform,
                 },
-                translate(current.busy ? 'deleting' : 'confirm'),
+                translate(current.cleanupPending
+                  ? current.busy ? 'cleaning' : 'retryCleanup'
+                  : current.busy ? 'deleting' : 'confirm'),
               ),
             ),
           ),
@@ -556,7 +702,7 @@ window.__ModuleLoader__.load({
       inject: ['remote'],
       async apply(ctx) {
         await ctx.remote.$mount(remoteContribution());
-        ctx.inject(['slots', 'locale', 'remote', 'remote.sessionDelete'], mountUI);
+        ctx.inject(['slots', 'locale', 'remote', 'remote.sessionDelete', 'sessions', 'workspaces'], mountUI);
       },
     };
   },

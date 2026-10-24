@@ -1,7 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
+import { Context } from '@deepseek-ai/cordis';
+import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session';
+import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
+import { deleteArchivedSession } from '../deletion.js';
+
+const { ClientSessions } = await import(new URL(
+  'types/client/sessions/service.js', import.meta.resolve('@deepseek-ai/dsh-api-session-controller'),
+));
 
 const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
 
@@ -16,14 +26,37 @@ function findNode(node, predicate) {
   return node.children?.map(child => findNode(child, predicate)).find(Boolean);
 }
 
-async function mountClient(response) {
+function snapshotStore(initial) {
+  let snapshot = initial;
+  const listeners = new Set();
+  return {
+    getSnapshot: () => snapshot,
+    subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+    set(value) { snapshot = value; for (const listener of listeners) listener(); },
+  };
+}
+
+async function mountClient(response, options = {}) {
   const components = new Map();
   const calls = [];
   const warnings = [];
+  const remoteListeners = new Set();
+  const disposers = [];
+  let refreshes = 0;
+  const sessions = options.sessions ?? {
+    list: snapshotStore({ ids: [], byId: {}, phase: 'ready' }),
+    refresh: async () => {},
+  };
+  const workspaces = options.workspaces ?? {
+    list: snapshotStore({ items: [], archivedSessionIds: [], phase: 'ready' }),
+  };
   const React = {
     Fragment: Symbol('Fragment'),
     createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
-    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useSyncExternalStore: (subscribe, snapshot) => {
+      const unsubscribe = subscribe(() => {});
+      try { return snapshot(); } finally { unsubscribe(); }
+    },
     useRef: value => ({ current: value }),
     useEffect: () => {},
   };
@@ -70,17 +103,30 @@ async function mountClient(response) {
   ]);
 
   services.set('remote', {
+    $on(event, listener) {
+      assert.equal(event, 'api-session/removed');
+      remoteListeners.add(listener);
+      return () => remoteListeners.delete(listener);
+    },
     async $mount(contribution) {
       assert.equal(contribution.descriptors[0].namespace, 'sessionDelete');
       await Promise.resolve();
       services.set('remote.sessionDelete', {
         async deleteArchived(id) {
           calls.push(id);
-          return response;
+          const result = typeof response === 'function' ? await response(id) : response;
+          options.onResponse?.(result);
+          return result;
         },
       });
     },
   });
+  services.set('sessions', {
+    list: sessions.list,
+    manager: sessions.manager ?? { getListSnapshot: () => ({ state: 'idle', error: null }) },
+    async refresh() { refreshes++; await sessions.refresh(); },
+  });
+  services.set('workspaces', workspaces);
 
   function createContext(inject) {
     const declared = new Set(inject);
@@ -98,6 +144,7 @@ async function mountClient(response) {
 
     const remote = {
       $mount: contribution => get('remote').$mount(contribution),
+      $on: (event, listener) => get('remote').$on(event, listener),
       get sessionDelete() {
         return get('remote.sessionDelete');
       },
@@ -114,7 +161,9 @@ async function mountClient(response) {
         get('remote');
         return remote;
       },
-      effect: callback => callback(),
+      get sessions() { return get('sessions'); },
+      get workspaces() { return get('workspaces'); },
+      effect: callback => { const dispose = callback(); if (typeof dispose === 'function') disposers.push(dispose); return dispose; },
       inject: (names, callback) => callback(createContext(names)),
     };
   }
@@ -123,9 +172,33 @@ async function mountClient(response) {
   return {
     calls,
     warnings,
+    sessions,
+    workspaces,
+    refreshes: () => refreshes,
+    async emitRemoved(id, source) {
+      sessions.handleSessionRemoved?.(id);
+      await Promise.all([...remoteListeners].map(listener => listener(id, source)));
+    },
+    dispose: () => { for (const dispose of disposers.reverse()) dispose(); },
     Menu: components.get('sidebar.workspaces.session.menu.item'),
     Overlay: components.get('shell.overlay'),
   };
+}
+
+function openMenu(client, id = 'fixture-only') {
+  client.Menu({
+    sessionId: id,
+    displayTitle: 'Fixture session',
+    useWorkspaces: selector => selector({ archivedSessionIds: [id] }),
+    useMenuOpenState: () => [true, () => {}],
+    useRemoteAccess: () => true,
+  }).props.onClick({ stopPropagation() {} });
+}
+
+function button(tree, label) {
+  const node = findNode(tree, item => item.type === 'button' && extractText(item) === label);
+  assert.ok(node, `Button ${label} must be visible`);
+  return node;
 }
 
 for (const outcome of ['success', 'error']) {
@@ -142,7 +215,7 @@ for (const outcome of ['success', 'error']) {
             error: { code: 'session-delete/session-in-use', message: 'Fixture service error', details: {} },
           };
 
-    const { calls, warnings, Menu, Overlay } = await mountClient(response);
+    const { calls, warnings, Menu, Overlay, refreshes } = await mountClient(response);
     assert.equal(typeof Menu, 'function');
     assert.equal(typeof Overlay, 'function');
 
@@ -187,15 +260,447 @@ for (const outcome of ['success', 'error']) {
       assert.equal(closeCalls, 1);
       assert.equal(findNode(result, node => node.type === 'dialog'), undefined);
       assert.deepEqual(warnings, [['[dsh-plugin-session-delete]', 'Fixture cleanup warning']]);
+      assert.equal(refreshes(), 1);
     } else {
       assert.equal(closeCalls, 0);
       assert.ok(findNode(result, node => node.type === 'dialog'));
       assert.deepEqual(warnings, []);
+      assert.equal(refreshes(), 1);
       assert.match(
         extractText(findNode(result, node => node.props.role === 'alert')),
-        /This session is still open or retained/,
+        /This session is still in use by another owner/,
       );
       assert.doesNotMatch(extractText(result), /Session deleted/);
     }
   });
 }
+
+test('cleanup failure keeps the dialog and offers a record-cleanup retry', async () => {
+  let attempts = 0;
+  const client = await mountClient(async () => ++attempts === 1
+    ? { ok: false, error: { code: 'session-delete/cleanup-failed', message: 'Logs deleted', details: { reason: 'Disk is full' } } }
+    : { ok: true, value: { warnings: [] } });
+  openMenu(client);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  const pending = client.Overlay();
+  assert.match(extractText(pending), /The conversation logs have been deleted/);
+  assert.match(extractText(findNode(pending, node => node.props.role === 'alert')), /Disk is full/);
+  button(pending, 'Close');
+  const retry = button(pending, 'Retry cleanup');
+  await Promise.all([retry.props.onClick(), retry.props.onClick()]);
+  assert.equal(attempts, 2);
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+});
+
+test('a list refresh failure never resends a completed deletion', async () => {
+  let disconnected = true;
+  const client = await mountClient({ ok: true, value: { warnings: [] } }, {
+    sessions: {
+      list: snapshotStore({ ids: [], byId: {}, phase: 'ready' }),
+      refresh: async () => { if (disconnected) throw new Error('Disconnected'); },
+    },
+  });
+  openMenu(client);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(client.calls, ['fixture-only']);
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+  assert.match(String(client.warnings[0][1]), /Disconnected/);
+  assert.match(extractText(findNode(client.Overlay(), node => node.props.role === 'alert')), /Disconnected/);
+  disconnected = false;
+  await button(client.Overlay(), 'Retry refresh').props.onClick();
+  assert.equal(findNode(client.Overlay(), node => node.props.role === 'alert'), undefined);
+  assert.deepEqual(client.calls, ['fixture-only']);
+});
+
+test('recovery notice waits for session and workspace baselines', async () => {
+  const sessions = { list: snapshotStore({ ids: [], byId: {}, phase: 'pending' }), refresh: async () => {} };
+  const workspaces = { list: snapshotStore({ archivedSessionIds: ['fixture-only'], phase: 'ready' }) };
+  const client = await mountClient({ ok: true, value: { warnings: [] } }, { sessions, workspaces });
+  assert.equal(findNode(client.Overlay(), node => node.type === 'aside'), undefined);
+  sessions.list.set({ ids: [], byId: {}, phase: 'ready' });
+  button(client.Overlay(), 'Review cleanup');
+  workspaces.list.set({ archivedSessionIds: ['fixture-only'], phase: 'pending' });
+  assert.equal(findNode(client.Overlay(), node => node.type === 'aside'), undefined);
+});
+
+test('overlay preserves the receiver of native method-based workspace sources', async () => {
+  const source = {
+    snapshot: { items: [], archivedSessionIds: ['fixture-only'], phase: 'ready' },
+    subscriptions: 0,
+    getSnapshot() { return this.snapshot; },
+    subscribe() { this.subscriptions++; return () => { this.subscriptions--; }; },
+  };
+  const client = await mountClient({ ok: true, value: { warnings: [] } }, { workspaces: { list: source } });
+  const overlay = client.Overlay();
+  assert.ok(findNode(overlay, node => node.type === 'style'));
+  await button(overlay, 'Review cleanup').props.onClick();
+  assert.ok(findNode(client.Overlay(), node => node.type === 'dialog'));
+  assert.equal(source.subscriptions, 0);
+});
+
+async function createConnectedFixture(t, { subagent = false } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-delete-client-')));
+  const host = new Context();
+  const clients = [];
+  const contexts = [];
+  const deliveries = [];
+  const id = 'connected-fixture';
+  let cleanupFails = false;
+  let mutations = 0;
+  const workspaces = { list: snapshotStore({ items: [], phase: 'ready', archivedSessionIds: [id] }) };
+  t.after(async () => {
+    try {
+      for (const client of clients) client.dispose();
+      await Promise.all(deliveries);
+      for (const context of contexts) await context.fiber.dispose();
+      await host.fiber.dispose();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  const fiber = host.plugin(Jsonl, { root: join(root, 'sessions'), compression: 'none' });
+  await fiber.await();
+  assert.equal(fiber.state, 2);
+  const writer = await host.sessionPersistence.create({
+    version: SESSION_FORMAT_VERSION, id, createdAt: 1, cwd: root, isSeeded: false,
+    ...(subagent ? { origin: 'subagent', parentSession: 'parent-fixture', delegationDepth: 1 } : {}),
+  });
+  await writer.flush();
+  const path = host.sessionPersistence.locate(writer.header).path;
+  await writer.close();
+  host.provide('sessions', { get: () => undefined });
+  host.provide('agents', { get: () => undefined });
+  host.provide('workspaceRegistry', {
+    get archivedSessionIds() { return workspaces.list.getSnapshot().archivedSessionIds; },
+    list: () => [{ detachSession: async () => { if (cleanupFails) throw new Error('Workspace disk is full'); } }],
+    async unarchiveSession(sessionId) {
+      workspaces.list.set({ ...workspaces.list.getSnapshot(), archivedSessionIds: this.archivedSessionIds.filter(value => value !== sessionId) });
+    },
+  });
+  // Reproduce the host's existing api-session/removed -> remote.$on relay.
+  host.on('api-session/removed', (sessionId, source) => {
+    for (const client of clients) deliveries.push(client.emitRemoved(sessionId, source));
+  });
+  return {
+    id, path, host, workspaces,
+    mutations: () => mutations,
+    failCleanup: value => { cleanupFails = value; },
+    settleNotifications: () => Promise.all(deliveries),
+    async connect({ onResponse } = {}) {
+      const context = new Context();
+      contexts.push(context);
+      let holdNextList;
+      let listsFail = false;
+      const sessions = new ClientSessions(context, {
+        session: {
+          async list() {
+            if (listsFail) return { ok: false, error: { code: 'gateway/internal', message: 'Fixture list unavailable', details: {} } };
+            const gate = holdNextList;
+            holdNextList = undefined;
+            const items = (await host.sessionPersistence.list()).map(({ header }) => ({
+              sessionId: header.id, updatedAt: header.createdAt, cwd: header.cwd,
+              origin: header.origin, parentSessionId: header.parentSession,
+              blank: false, running: false, agentAvailable: false,
+            }));
+            if (gate) { gate.entered.resolve(); await gate.release.promise; }
+            return { ok: true, value: { items } };
+          },
+        },
+      });
+      await sessions.refresh();
+      const client = await mountClient(async sessionId => {
+        mutations++;
+        try {
+          return { ok: true, value: await deleteArchivedSession(host, sessionId) };
+        } catch (error) {
+          return { ok: false, error: { code: error.code, message: error.message, details: error.details } };
+        }
+      }, { sessions, workspaces, onResponse });
+      clients.push(client);
+      return Object.assign(client, {
+        nativeSessions: sessions,
+        failLists: value => { listsFail = value; },
+        holdNextList() {
+          const gate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+          holdNextList = gate;
+          return gate;
+        },
+      });
+    },
+  };
+}
+
+for (const subagent of [false, true]) {
+  test(`deletion removes a ${subagent ? 'subagent' : 'session'} from two native client lists despite an older refresh`, async t => {
+    const f = await createConnectedFixture(t, { subagent });
+    const first = await f.connect();
+    const second = await f.connect();
+    assert.deepEqual(first.sessions.list.getSnapshot().ids, [f.id]);
+    const gate = second.holdNextList();
+    const staleRefresh = second.nativeSessions.refresh();
+    await gate.entered.promise;
+    try {
+      openMenu(first, f.id);
+      await button(first.Overlay(), 'Delete session').props.onClick();
+      assert.equal(existsSync(f.path), false);
+    } finally {
+      gate.release.resolve();
+    }
+    await staleRefresh;
+    await f.settleNotifications();
+    assert.deepEqual(first.sessions.list.getSnapshot().ids, []);
+    assert.deepEqual(second.sessions.list.getSnapshot().ids, []);
+    assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+    assert.equal(f.mutations(), 1);
+  });
+}
+
+test('native list failure is visible in both windows and retry only refreshes the list', async t => {
+  const f = await createConnectedFixture(t, { subagent: true });
+  const first = await f.connect();
+  const second = await f.connect();
+  for (const client of [first, second]) client.failLists(true);
+  openMenu(first, f.id);
+  await button(first.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(existsSync(f.path), false);
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+  for (const client of [first, second]) {
+    assert.deepEqual(client.sessions.list.getSnapshot().ids, [f.id]);
+    assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+    assert.match(extractText(findNode(client.Overlay(), node => node.props.role === 'alert')), /Fixture list unavailable/);
+    await button(client.Overlay(), 'Retry refresh').props.onClick();
+    assert.match(extractText(client.Overlay()), /Could not refresh/);
+    client.failLists(false);
+    await button(client.Overlay(), 'Retry refresh').props.onClick();
+    assert.deepEqual(client.sessions.list.getSnapshot().ids, []);
+    assert.equal(findNode(client.Overlay(), node => node.props.role === 'alert'), undefined);
+  }
+  assert.equal(f.mutations(), 1);
+});
+
+test('refresh retry leaves a pending cleanup dialog and its action intact', async t => {
+  const f = await createConnectedFixture(t);
+  const client = await f.connect();
+  f.failCleanup(true);
+  client.failLists(true);
+  openMenu(client, f.id);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.match(extractText(client.Overlay()), /Workspace disk is full/);
+  assert.match(extractText(client.Overlay()), /Fixture list unavailable/);
+  client.failLists(false);
+  await button(client.Overlay(), 'Retry refresh').props.onClick();
+  assert.match(extractText(client.Overlay()), /Workspace disk is full/);
+  assert.doesNotMatch(extractText(client.Overlay()), /Could not refresh/);
+  assert.equal(f.mutations(), 1);
+  f.failCleanup(false);
+  await button(client.Overlay(), 'Retry cleanup').props.onClick();
+  await f.settleNotifications();
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+});
+
+test('cleanup remains reachable after closing the dialog while list refresh still fails', async t => {
+  const f = await createConnectedFixture(t);
+  const client = await f.connect();
+  f.failCleanup(true);
+  client.failLists(true);
+  openMenu(client, f.id);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  button(client.Overlay(), 'Close').props.onClick();
+  const notice = client.Overlay();
+  button(notice, 'Retry refresh');
+  button(notice, 'Review cleanup').props.onClick();
+  f.failCleanup(false);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(existsSync(f.path), false);
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+  button(client.Overlay(), 'Retry refresh');
+  assert.equal(f.mutations(), 2);
+});
+
+test('reconnecting during a refresh retry keeps a retry action until a confirmed success', async t => {
+  const f = await createConnectedFixture(t, { subagent: true });
+  const client = await f.connect();
+  client.failLists(true);
+  openMenu(client, f.id);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  const oldReply = Promise.withResolvers();
+  const newReply = Promise.withResolvers();
+  const failure = { ok: false, error: { code: 'gateway/internal', message: 'Connection interrupted', details: {} } };
+  let requests = 0;
+  client.nativeSessions.manager.remote.session.list = () => ++requests === 1 ? oldReply.promise : newReply.promise;
+  try {
+    const retry = button(client.Overlay(), 'Retry refresh').props.onClick();
+    client.nativeSessions.handleConnected();
+    const replacement = client.nativeSessions.refresh();
+    oldReply.resolve(failure);
+    await retry;
+    assert.equal(client.nativeSessions.manager.getListSnapshot().state, 'loading');
+    button(client.Overlay(), 'Retry refresh');
+    newReply.resolve(failure);
+    await replacement;
+    assert.equal(client.nativeSessions.manager.getListSnapshot().state, 'error');
+    button(client.Overlay(), 'Retry refresh');
+    assert.deepEqual(client.sessions.list.getSnapshot().ids, [f.id]);
+    client.nativeSessions.manager.remote.session.list = async () => ({ ok: true, value: { items: [] } });
+    await button(client.Overlay(), 'Retry refresh').props.onClick();
+    assert.deepEqual(client.sessions.list.getSnapshot().ids, []);
+    assert.equal(findNode(client.Overlay(), node => node.props.role === 'alert'), undefined);
+    assert.equal(f.mutations(), 1);
+  } finally {
+    oldReply.resolve(failure);
+    newReply.resolve(failure);
+  }
+});
+
+test('cleanup retry succeeds after another window has already completed it', async t => {
+  const f = await createConnectedFixture(t);
+  const first = await f.connect();
+  const second = await f.connect();
+  f.failCleanup(true);
+  openMenu(first, f.id);
+  await button(first.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  button(first.Overlay(), 'Retry cleanup');
+
+  f.failCleanup(false);
+  button(second.Overlay(), 'Review cleanup').props.onClick();
+  await button(second.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+  await button(first.Overlay(), 'Retry cleanup').props.onClick();
+  await f.settleNotifications();
+  assert.equal(findNode(first.Overlay(), node => node.type === 'dialog'), undefined);
+  assert.equal(existsSync(f.path), false);
+  assert.equal(f.mutations(), 3);
+});
+
+test('retry succeeds when the original deletion completed but its response was lost', async t => {
+  const f = await createConnectedFixture(t);
+  let responseLost = false;
+  const client = await f.connect({
+    onResponse(result) {
+      if (result.ok && !responseLost) {
+        responseLost = true;
+        throw new Error('Fixture response lost');
+      }
+    },
+  });
+  openMenu(client, f.id);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(existsSync(f.path), false);
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+  assert.match(extractText(client.Overlay()), /Fixture response lost/);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+  assert.equal(f.mutations(), 2);
+});
+
+test('failed cleanup can be found and retried after rebuilding the client from native baselines', async t => {
+  const f = await createConnectedFixture(t);
+  const first = await f.connect();
+  f.failCleanup(true);
+  openMenu(first, f.id);
+  await button(first.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(existsSync(f.path), false);
+  assert.deepEqual(first.sessions.list.getSnapshot().ids, []);
+  assert.match(extractText(first.Overlay()), /Workspace disk is full/);
+  button(first.Overlay(), 'Retry cleanup');
+  await button(first.Overlay(), 'Close').props.onClick();
+  button(first.Overlay(), 'Review cleanup');
+  first.dispose();
+
+  const reloaded = await f.connect();
+  await button(reloaded.Overlay(), 'Review cleanup').props.onClick();
+  assert.match(extractText(reloaded.Overlay()), new RegExp(f.id));
+  f.failCleanup(false);
+  await button(reloaded.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.equal(findNode(reloaded.Overlay(), node => node.type === 'dialog' || node.type === 'aside'), undefined);
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, []);
+  assert.equal(f.mutations(), 2);
+});
+
+for (const cleanupFails of [false, true]) {
+  test(`a pending list request does not delay the ${cleanupFails ? 'cleanup error' : 'successful deletion'} UI`, async t => {
+    const f = await createConnectedFixture(t);
+    const responseReady = Promise.withResolvers();
+    const client = await f.connect({ onResponse: responseReady.resolve });
+    f.failCleanup(cleanupFails);
+    const gate = client.holdNextList();
+    const staleRefresh = client.nativeSessions.refresh();
+    await gate.entered.promise;
+    openMenu(client, f.id);
+    let settled = false;
+    const operation = button(client.Overlay(), 'Delete session').props.onClick().then(() => { settled = true; });
+    try {
+      await responseReady.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, true, 'Deletion response must settle while the list request is still pending');
+      assert.equal(existsSync(f.path), false);
+      if (cleanupFails) {
+        const overlay = client.Overlay();
+        assert.match(extractText(overlay), /Workspace disk is full/);
+        assert.equal(button(overlay, 'Retry cleanup').props.disabled, false);
+        assert.equal(button(overlay, 'Close').props.disabled, false);
+      } else {
+        assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+      }
+      assert.equal(f.mutations(), 1);
+    } finally {
+      gate.release.resolve();
+      await staleRefresh;
+      await operation;
+      await f.settleNotifications();
+    }
+  });
+}
+
+test('a corrupt first record does not prevent choosing and cleaning a later record', async t => {
+  const f = await createConnectedFixture(t);
+  writeFileSync(f.path, '{corrupt-header');
+  const secondId = 'missing-log-cleanup-target';
+  f.workspaces.list.set({ ...f.workspaces.list.getSnapshot(), archivedSessionIds: [f.id, secondId] });
+  const client = await f.connect();
+  function choose(id) {
+    const select = findNode(client.Overlay(), node => node.type === 'select');
+    assert.ok(select);
+    assert.ok(findNode(select, node => node.type === 'option' && node.props.value === id));
+    select.props.onChange({ target: { value: id } });
+  }
+  choose(f.id);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  assert.match(extractText(findNode(client.Overlay(), node => node.props.role === 'alert')), /corrupt/);
+  button(client.Overlay(), 'Cancel').props.onClick();
+
+  choose(secondId);
+  assert.equal(extractText(findNode(client.Overlay(), node => node.type === 'code')), secondId);
+  await button(client.Overlay(), 'Delete session').props.onClick();
+  await f.settleNotifications();
+  assert.deepEqual(client.calls, [f.id, secondId]);
+  assert.deepEqual(f.workspaces.list.getSnapshot().archivedSessionIds, [f.id]);
+  assert.equal(existsSync(f.path), true);
+  assert.equal(findNode(client.Overlay(), node => node.type === 'dialog'), undefined);
+});
+
+test('ordinary subagent disposal does not trigger the deletion plugin list refresh', async t => {
+  const f = await createConnectedFixture(t, { subagent: true });
+  const client = await f.connect();
+  await client.emitRemoved(f.id);
+  assert.equal(client.refreshes(), 0);
+  f.workspaces.list.set({ ...f.workspaces.list.getSnapshot(), archivedSessionIds: [] });
+  await client.emitRemoved(f.id);
+  assert.equal(client.refreshes(), 0);
+  assert.equal(existsSync(f.path), true);
+  assert.deepEqual(client.sessions.list.getSnapshot().ids, [f.id]);
+  assert.equal(f.mutations(), 0);
+});

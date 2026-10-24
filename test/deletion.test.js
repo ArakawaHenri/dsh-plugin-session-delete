@@ -13,19 +13,20 @@ import {
 } from '@deepseek-ai/dsh-session-persistence';
 import { deleteArchivedSession } from '../deletion.js';
 
-function createFixture(t, compression = 'none') {
+function createFixture(t, compression = 'none', version = 4) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-plugin-session-delete-test-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const id = 'fixture-only';
   const directory = join(root, '_no-cwd', id);
   mkdirSync(directory, { recursive: true });
-  const current = join(directory, `session.v4.jsonl${compression === 'zstd' ? '.zstd' : ''}`);
-  const header = { version: 4, id, createdAt: 1, isSeeded: false };
+  const current = join(directory, `session.v${version}.jsonl${compression === 'zstd' ? '.zstd' : ''}`);
+  const header = { version, id, createdAt: 1, isSeeded: false };
   writeFileSync(current, `${JSON.stringify(header)}\n`);
   const lock = join(directory, 'session.lock');
   writeFileSync(lock, '');
   const lockInode = lstatSync(lock).ino;
   const calls = [];
+  const events = [];
   let owned = false;
 
   const persistence = {
@@ -61,6 +62,7 @@ function createFixture(t, compression = 'none') {
     },
   };
   const ctx = {
+    emit: (...args) => events.push(args),
     sessionPersistence: persistence,
     sessions: { get: () => undefined },
     agents: { get: () => undefined },
@@ -75,7 +77,7 @@ function createFixture(t, compression = 'none') {
     },
   };
   return {
-    root, id, directory, current, header, lock, lockInode, calls, persistence, ctx,
+    root, id, directory, current, header, lock, lockInode, calls, events, persistence, ctx,
     remove: () => deleteArchivedSession(ctx, id),
   };
 }
@@ -125,8 +127,43 @@ for (const compression of ['none', 'zstd']) {
     assert.deepEqual(await f.remove(), { warnings: [] });
     assert.equal(lstatSync(f.lock).ino, f.lockInode);
     assert.deepEqual(f.calls, ['open', 'detach', 'unarchive', 'close']);
+    if (!f.context) assert.deepEqual(f.events, [['api-session/removed', f.id, 'dsh-plugin-session-delete']]);
   });
 }
+
+test('uses the backend current-generation declaration without assuming format v4', async t => {
+  const f = createFixture(t, 'none', 7);
+  writeFileSync(join(f.directory, 'session.v4.jsonl'), 'historical fixture');
+  writeFileSync(join(f.directory, 'session.v6.jsonl'), 'historical fixture');
+  assert.deepEqual(await f.remove(), { warnings: [] });
+  assert.deepEqual(readdirSync(f.directory), ['session.lock']);
+});
+
+test('reports an unavailable locator without removing storage or metadata', async t => {
+  const f = createFixture(t);
+  delete f.persistence.locate;
+  await assertRefuses(f.remove, 'unsupported-backend');
+  assert.ok(existsSync(f.current));
+  assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, [f.id]);
+  assert.deepEqual(f.calls, []);
+});
+
+test('an unavailable lifecycle action only prevents deletion while the Agent is retained', async t => {
+  const f = createFixture(t);
+  const session = { id: f.id };
+  const agent = { id: f.id, session, status: 'idle' };
+  f.ctx.sessions.get = () => session;
+  f.ctx.agents.get = () => agent;
+  // This host exposes no Cordis lifecycle collection to the plugin.
+  await assertRefuses(f.remove, 'unsupported-runtime');
+  assert.ok(existsSync(f.current));
+  assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, [f.id]);
+  assert.deepEqual(f.calls, []);
+
+  f.ctx.sessions.get = () => undefined;
+  f.ctx.agents.get = () => undefined;
+  assert.deepEqual(await f.remove(), { warnings: [] });
+});
 
 for (const kind of ['unarchived', 'live', 'agent', 'activity', 'old-format', 'backend']) {
   test(`refuses ${kind} without removing logs or metadata`, async t => {
@@ -145,6 +182,7 @@ for (const kind of ['unarchived', 'live', 'agent', 'activity', 'old-format', 'ba
     await assertRefuses(f.remove, codes[kind]);
     assert.ok(existsSync(f.current));
     assert.deepEqual(f.calls, kind === 'activity' ? ['open', 'close'] : []);
+    assert.deepEqual(f.events, []);
   });
 }
 
@@ -209,9 +247,13 @@ test('metadata cleanup can retry after deletion without an in-memory receipt', a
   f.ctx.workspaceRegistry.list = () => [{
     detachSession: async () => { throw new Error('fixture cleanup failure'); },
   }];
-  const result = await f.remove();
-  assert.match(result.warnings[0], /workspace cleanup needs a retry/);
+  await assert.rejects(f.remove, error => {
+    assert.equal(error.code, 'session-delete/cleanup-failed');
+    assert.equal(error.details.reason, 'fixture cleanup failure');
+    return true;
+  });
   assert.ok(!existsSync(f.current));
+  assert.deepEqual(f.events, [['api-session/removed', f.id, 'dsh-plugin-session-delete']]);
   assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, [f.id]);
   f.ctx.workspaceRegistry.list = list;
 
@@ -219,21 +261,27 @@ test('metadata cleanup can retry after deletion without an in-memory receipt', a
   assert.deepEqual(f.calls, ['open', 'close', 'read', 'detach', 'unarchive']);
 });
 
-test('cleans an archived entry only after native open confirms the logs are absent', async t => {
+test('metadata cleanup is repeatable after native open confirms the logs are absent', async t => {
   const f = createFixture(t);
   rmSync(f.current);
   assert.deepEqual(await f.remove(), { warnings: [] });
-  assert.deepEqual(f.calls, ['read', 'detach', 'unarchive']);
+  assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, []);
+  assert.deepEqual(await f.remove(), { warnings: [] });
+  assert.deepEqual(f.calls, ['read', 'detach', 'unarchive', 'read', 'detach', 'unarchive']);
 });
 
-test('an unreadable header is not treated as missing storage', async t => {
-  const f = createFixture(t);
-  writeFileSync(f.current, '{truncated');
-  await assert.rejects(f.remove, { name: 'SessionPersistenceCorruptionError' });
-  assert.ok(existsSync(f.current));
-  assert.deepEqual(f.calls, ['read']);
-  assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, [f.id]);
-});
+for (const archived of [true, false]) {
+  test(`an unreadable ${archived ? 'archived' : 'unarchived'} header is not treated as missing storage`, async t => {
+    const f = createFixture(t);
+    const archiveIds = archived ? [f.id] : [];
+    f.ctx.workspaceRegistry.archivedSessionIds = archiveIds;
+    writeFileSync(f.current, '{truncated');
+    await assert.rejects(f.remove, { name: 'SessionPersistenceCorruptionError' });
+    assert.ok(existsSync(f.current));
+    assert.deepEqual(f.calls, ['read']);
+    assert.deepEqual(f.ctx.workspaceRegistry.archivedSessionIds, archiveIds);
+  });
+}
 
 test('a readable session with an inconclusive stat is left unchanged', async t => {
   const f = createFixture(t);

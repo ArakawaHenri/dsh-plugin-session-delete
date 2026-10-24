@@ -9,7 +9,7 @@ import * as plugin from '../index.js';
 const SESSION_ID = 'fixture-only';
 const ENDPOINT = 'sessionDelete/deleteArchived';
 
-async function createFixture(t, { archived = true, inUse = false, active = false }) {
+async function createFixture(t, { archived = true, missing = true, inUse = false, active = false, cleanupFails = false }) {
   const ctx = new Context();
   t.after(() => ctx.fiber.dispose());
 
@@ -18,14 +18,14 @@ async function createFixture(t, { archived = true, inUse = false, active = false
     sessionPersistence: {
       name: 'session-persistence-jsonl',
       identity: Symbol('fixture-persistence'),
-      stat: async () => undefined,
+      stat: async () => missing ? undefined : { header: { id: SESSION_ID }, formatStatus: 'current' },
       open: async () => { throw new SessionPersistenceNotFoundError(SESSION_ID); },
     },
     sessions: { get: () => (inUse ? {} : undefined) },
     agents: { get: () => undefined },
     workspaceRegistry: {
       archivedSessionIds: archived ? [SESSION_ID] : [],
-      list: () => [],
+      list: () => cleanupFails ? [{ detachSession: async () => { throw new Error('Fixture workspace write failed'); } }] : [],
       unarchiveSession: async () => {},
     },
   })) {
@@ -74,10 +74,16 @@ test('RPC completes metadata cleanup without optional Agent tools or search serv
   assert.deepEqual(await fixture.invoke(), { ok: true, value: { warnings: [] } });
 });
 
+test('RPC succeeds for a session whose logs and archive entry were already removed', async t => {
+  const fixture = await createFixture(t, { archived: false });
+  assert.deepEqual(await fixture.invoke(), { ok: true, value: { warnings: [] } });
+});
+
 for (const scenario of [
   { code: 'session-in-use', options: { inUse: true }, message: /Close this session in all windows/ },
-  { code: 'not-archived', options: { archived: false }, message: /Archive the session before deleting/ },
+  { code: 'not-archived', options: { archived: false, missing: false }, message: /Archive the session before deleting/ },
   { code: 'session-active', options: { active: true }, message: /running work or active reminders/ },
+  { code: 'cleanup-failed', options: { cleanupFails: true }, message: /Logs deleted/ },
 ]) {
   test(`RPC preserves ${scenario.code} through the real Connection parser`, async t => {
     const fixture = await createFixture(t, scenario.options);
@@ -87,6 +93,7 @@ for (const scenario of [
     assert.equal(result.error.code, `session-delete/${scenario.code}`);
     assert.match(result.error.message, scenario.message);
     assert.equal(result.error.message, fixture.failure().message);
-    assert.deepEqual(result.error.details, {});
+    assert.deepEqual(result.error.details, scenario.code === 'cleanup-failed'
+      ? { reason: 'Fixture workspace write failed' } : {});
   });
 }

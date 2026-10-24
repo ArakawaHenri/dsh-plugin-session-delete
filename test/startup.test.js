@@ -37,7 +37,7 @@ function createFixture(t, { deferMount = false, lateNamespace = false } = {}) {
   const dictionaries = new Map();
   const errors = [];
   const fibers = new Set();
-  const counts = { mounts: 0, rpc: 0, localeDisposals: 0, slotDisposals: 0 };
+  const counts = { mounts: 0, rpc: 0, refreshes: 0, localeDisposals: 0, slotDisposals: 0 };
   const entered = Promise.withResolvers();
   const mountGate = Promise.withResolvers();
   if (!deferMount) mountGate.resolve();
@@ -107,6 +107,11 @@ function createFixture(t, { deferMount = false, lateNamespace = false } = {}) {
       super(ctx, 'remote');
     }
 
+    $on(event, listener) {
+      assert.equal(event, 'api-session/removed');
+      return this.ctx.on(event, listener);
+    }
+
     async $mount(contribution) {
       counts.mounts++;
       assert.equal(contribution.package, 'dsh-plugin-session-delete');
@@ -120,6 +125,12 @@ function createFixture(t, { deferMount = false, lateNamespace = false } = {}) {
   new Slots();
   new Locale();
   new Remote();
+  ctx.provide('sessions', {
+    refresh: async () => { counts.refreshes++; },
+    list: { getSnapshot: () => ({ ids: [] }) },
+    manager: { getListSnapshot: () => ({ state: 'idle', error: null }) },
+  });
+  ctx.provide('workspaces', { list: {} });
 
   t.after(async () => {
     mountGate.resolve();
@@ -157,6 +168,8 @@ function assertMounted(f, child) {
   assert.deepEqual(f.errors, []);
   assert.equal(typeof child.ctx.remote.sessionDelete.deleteArchived, 'function');
   assert.ok(Object.hasOwn(child.inject, 'remote.sessionDelete'));
+  assert.ok(Object.hasOwn(child.inject, 'sessions'));
+  assert.ok(Object.hasOwn(child.inject, 'workspaces'));
   assert.deepEqual(Object.keys(f.root.inject), ['remote']);
 }
 
@@ -180,6 +193,10 @@ test('client plugin awaits $mount, activates UI child, and cleans up on dispose'
   const [child] = f.children();
   await child.await();
   assertMounted(f, child);
+  await f.ctx.parallel('api-session/removed', 'fixture-only');
+  assert.equal(f.counts.refreshes, 0);
+  await f.ctx.parallel('api-session/removed', 'fixture-only', 'dsh-plugin-session-delete');
+  assert.equal(f.counts.refreshes, 1);
 
   await f.root.dispose();
   assert.equal(f.root.state, State.DISPOSED);
@@ -188,6 +205,8 @@ test('client plugin awaits $mount, activates UI child, and cleans up on dispose'
   assert.equal(f.counts.localeDisposals, 1);
   assert.equal(f.counts.slotDisposals, 2);
   assert.equal(f.ctx.get('remote.sessionDelete'), undefined);
+  await f.ctx.parallel('api-session/removed', 'fixture-only', 'dsh-plugin-session-delete');
+  assert.equal(f.counts.refreshes, 1, 'Disposed UI must unsubscribe from removal notifications');
   assert.deepEqual(f.errors, []);
 });
 
